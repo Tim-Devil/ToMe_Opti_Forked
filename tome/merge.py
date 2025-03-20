@@ -41,35 +41,65 @@ def bipartite_soft_matching(
 
     # We can only reduce by a maximum of 50% tokens
     t = metric.shape[1]
+    # Return the size of metric's second dimension(token num.)
     r = min(r, (t - protected) // 2)
+    # In reality we should reduce how much token.
+    # Should not exceed half of 't'.
 
     if r <= 0:
         return do_nothing, do_nothing
+    
+    # Just do nothing. Protection method.
 
     with torch.no_grad():
-        metric = metric / metric.norm(dim=-1, keepdim=True)
-        a, b = metric[..., ::2, :], metric[..., 1::2, :]
-        scores = a @ b.transpose(-1, -2)
+        # create context and clear it automatically.
+        # Use it to disable grad computation temporarily.
 
+        metric = metric / metric.norm(dim=-1, keepdim=True)
+        # normalize it by L2.
+
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        # divide it to odd and even index.
+        scores = a @ b.transpose(-1, -2)
+        # compute similarity score between a and b.
+
+        # do masking operation.
         if class_token:
             scores[..., 0, :] = -math.inf
+        # class token: (0, s)
         if distill_token:
             scores[..., :, 0] = -math.inf
+        # distill token: (s, 0)
 
         node_max, node_idx = scores.max(dim=-1)
+        # max: return `max num` and `max index`.
+        # dim=-1: find max num in a row
+        # about dim: https://zhuanlan.zhihu.com/p/525276061
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+        # argsort: sort and return index. 
+        # the highest similarity should be merged first.
 
-        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
-        src_idx = edge_idx[..., :r, :]  # Merged Tokens
+        unm_idx = edge_idx[..., r:, :]  
+        # store Unmerged Tokens
+        src_idx = edge_idx[..., :r, :]  
+        # store Merged Tokens
         dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        # use None to shape it. Keep shape alignment.
 
+        # Put class token at first to protect it.
         if class_token:
             # Sort to ensure the class token is at the start
             unm_idx = unm_idx.sort(dim=1)[0]
 
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
+        # odd and even element.
+
         n, t1, c = src.shape
+        # n: size of batch(row)
+        # t1: token length(col)
+        # c: 
+
         unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
         src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
         dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
@@ -79,6 +109,7 @@ def bipartite_soft_matching(
         else:
             return torch.cat([unm, dst], dim=1)
 
+    # Used to restore origin position.
     def unmerge(x: torch.Tensor) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
@@ -207,6 +238,7 @@ def random_bipartite_soft_matching(
     return merge, unmerge
 
 
+# add weight to origin x matrix.
 def merge_wavg(
     merge: Callable, x: torch.Tensor, size: torch.Tensor = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -224,6 +256,7 @@ def merge_wavg(
     return x, size
 
 
+# display merge process by matrix.
 def merge_source(
     merge: Callable, x: torch.Tensor, source: torch.Tensor = None
 ) -> torch.Tensor:
