@@ -140,6 +140,12 @@ ADD:
     Rewrite the whole judging standard.
     Use k-means to compute the nearest element.
     (All in all we just need to know what we need to merge.)
+    OK so we add group technique. After all they can coexist.
+    Simply using K_means may also save Memory. Maybe.
+
+    Update: OK I must confess that it is useless.
+    Because we still need hadamard times.
+    ......Waste my time. Skip this.
 
 3. IGA_bipartite_soft_matching:
     Use Iterative greedy algorithm.
@@ -147,6 +153,8 @@ ADD:
 
 '''
 
+# ------------------------------------------------------------------------------------------
+# Grouped:
 
 def grouped_bipartite_soft_matching(
     metric: torch.Tensor,   # input matrix
@@ -186,7 +194,7 @@ def grouped_bipartite_soft_matching(
         best_scores = torch.full((batch_size, num_a_tokens), -float('inf'), device=metric.device)
         best_indices = torch.zeros((batch_size, num_a_tokens), dtype=torch.long, device=metric.device)
         
-        # Process in chunks to save memory
+        # Process in chunks to save memory.
         num_b_tokens = b.shape[1]
         for chunk_start in range(0, num_b_tokens, chunk_size):
             # Maybe not exact division
@@ -255,19 +263,174 @@ def grouped_bipartite_soft_matching(
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         n, _, c = unm.shape
 
-        # Recover the source tokens
         src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
 
-        # Initialize output tensor
         out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
 
-        # Place destination tokens
         out[..., 1::2, :] = dst
-        
-        # Place unmerged and source tokens
+
         out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
         out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
 
+        return out
+
+    return merge, unmerge
+
+# ------------------------------------------------------------------------------------------
+# K-means:
+
+def kmeans_bipartite_soft_matching(
+    metric: torch.Tensor,
+    r: int,
+    class_token: bool = False,
+    distill_token: bool = False,
+    max_iters: int = 3,
+) -> Tuple[Callable, Callable]:
+
+    protected = 0
+    if class_token:
+        protected += 1
+    if distill_token:
+        protected += 1
+
+    t = metric.shape[1]
+    r = min(r, (t - protected) // 2)
+
+    if r <= 0:
+        return do_nothing, do_nothing
+    
+    with torch.no_grad():
+        # Normalize.
+        metric = metric / metric.norm(dim=-1, keepdim=True)
+        
+        # odd and even split.
+        # (finally I remember "split" :/ )
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        
+        # define size
+        batch_size, num_a = a.shape
+        num_b = b.shape[1]
+        
+        # select some K center.
+        # "some" means r. r element will be merged to b matrix.
+        random_indices = torch.randperm(num_b, device=metric.device)[:r]
+        centroids = b[:, random_indices, :]
+
+        '''
+        Here we know that the key design is:
+        "Do not exceed 50% token."
+        Through constructing mapping association between a and b
+        We can reconstruct.
+        (So we do not use original K-means, reducing `size-r` token.)
+        '''
+        
+        # tracking matrix.
+        src_idx = torch.zeros(batch_size, r, 1, dtype=torch.long, device=metric.device)
+        
+        # Mask.
+        protected_mask = torch.zeros(num_a, dtype=torch.bool, device=metric.device)
+        if class_token:
+            protected_mask[0] = True
+        
+        # k-means algorithm
+        for _ in range(max_iters):
+            # Use grouped technique.
+            chunk_size = min(num_a, 1024)
+            assignments = torch.zeros(batch_size, num_a, dtype=torch.long, device=metric.device)
+            
+            for chunk_start in range(0, num_a, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_a)
+                chunk_a = a[:, chunk_start:chunk_end, :]
+                
+                similarities = torch.bmm(chunk_a, centroids.transpose(1, 2))
+                
+                chunk_protected = protected_mask[chunk_start:chunk_end]
+                if chunk_protected.any():
+                    similarities[:, chunk_protected, :] = -math.inf
+                
+                _, chunk_assignments = similarities.max(dim=2)
+
+                assignments[:, chunk_start:chunk_end] = chunk_assignments
+            
+            new_centroids = torch.zeros_like(centroids)
+            counts = torch.zeros(batch_size, r, 1, device=metric.device)
+            
+            for i in range(r):
+                mask = (assignments == i).unsqueeze(-1)
+                
+                # features of assigned tokens
+                new_centroids[:, i:i+1, :] = torch.sum(a * mask, dim=1, keepdim=True)
+                # Count number of assigned tokens
+                counts[:, i:i+1, :] = mask.sum(dim=1, keepdim=True).clamp(min=1)
+            
+            # Average the features
+            new_centroids = new_centroids / counts
+            
+            if torch.allclose(centroids, new_centroids, atol=1e-6):
+                break
+                
+            centroids = new_centroids
+        
+        # Calculate final assignments
+        for i in range(r):
+            mask = (assignments == i)
+            
+            # pick one token assigned to this centroid
+            for batch_idx in range(batch_size):
+                batch_mask = mask[batch_idx]
+                if batch_mask.any():
+                    # Choose one of the assigned tokens
+                    token_idx = batch_mask.nonzero(as_tuple=True)[0][0]
+                    src_idx[batch_idx, i, 0] = token_idx
+        
+        # Get indices of unmerged tokens
+        all_idx = torch.arange(num_a, device=metric.device)
+        merged_mask = torch.zeros(batch_size, num_a, dtype=torch.bool, device=metric.device)
+        
+        for batch_idx in range(batch_size):
+            merged_mask[batch_idx, src_idx[batch_idx, :, 0]] = True
+        
+        unm_idx = torch.zeros(batch_size, num_a - r, 1, dtype=torch.long, device=metric.device)
+        for batch_idx in range(batch_size):
+            unmerged = all_idx[~merged_mask[batch_idx]]
+            unm_idx[batch_idx, :, 0] = unmerged
+        
+        # For K-means, we use the centroid index directly
+        dst_idx = torch.arange(r, device=metric.device).expand(batch_size, r, 1)
+        
+        # Put class token at first to protect it
+        if class_token:
+            unm_idx = unm_idx.sort(dim=1)[0]
+
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        n, t1, c = src.shape
+        
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+
+        token_to_merge = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), token_to_merge, reduce=mode)
+
+        if distill_token:
+            return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
+        else:
+            return torch.cat([unm, dst], dim=1)
+
+    def unmerge(x: torch.Tensor) -> torch.Tensor:
+        unm_len = unm_idx.shape[1]
+        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+        n, _, c = unm.shape
+
+        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
+
+        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
+
+        out[..., 1::2, :] = dst
+
+        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
+        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+        
         return out
 
     return merge, unmerge
