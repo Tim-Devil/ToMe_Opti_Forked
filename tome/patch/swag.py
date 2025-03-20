@@ -14,7 +14,7 @@ from typing import Tuple
 
 import torch
 
-from tome.merge import bipartite_soft_matching, merge_source, merge_wavg
+from tome.merge import bipartite_soft_matching, merge_source, merge_wavg, grouped_bipartite_soft_matching
 from tome.utils import parse_r
 
 # Since we don't necessarily have the swag code available, this patch is a little bit more involved
