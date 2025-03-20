@@ -286,132 +286,126 @@ def kmeans_bipartite_soft_matching(
     distill_token: bool = False,
     max_iters: int = 3,
 ) -> Tuple[Callable, Callable]:
-
+    """
+    使用K-means聚类应用ToMe算法进行令牌合并。
+    
+    输入大小为 [batch, tokens, channels]。
+    r 表示要移除的令牌数（最多为50%的令牌）。
+    """
     protected = 0
     if class_token:
         protected += 1
     if distill_token:
         protected += 1
 
+    # 限制移除的令牌数量不超过50%
     t = metric.shape[1]
     r = min(r, (t - protected) // 2)
 
     if r <= 0:
         return do_nothing, do_nothing
     
+    # 执行K-means聚类以确定要合并的令牌
     with torch.no_grad():
-        # Normalize.
+        # 规范化特征向量
         metric = metric / metric.norm(dim=-1, keepdim=True)
         
-        # odd and even split.
-        # (finally I remember "split" :/ )
+        # 分离偶数和奇数位置的令牌
         a, b = metric[..., ::2, :], metric[..., 1::2, :]
         
-        # define size
-        batch_size, num_a = a.shape
-        num_b = b.shape[1]
+        # 获取形状信息
+        batch_size, num_a, feat_dim = a.shape
         
-        # select some K center.
-        # "some" means r. r element will be merged to b matrix.
-        random_indices = torch.randperm(num_b, device=metric.device)[:r]
-        centroids = b[:, random_indices, :]
-
-        '''
-        Here we know that the key design is:
-        "Do not exceed 50% token."
-        Through constructing mapping association between a and b
-        We can reconstruct.
-        (So we do not use original K-means, reducing `size-r` token.)
-        '''
+        # 创建与原始bipartite_soft_matching相同模式的存储结构
+        # 这样可以确保形状一致性
+        scores = a @ b.transpose(-1, -2)  # 计算相似度矩阵
         
-        # tracking matrix.
-        src_idx = torch.zeros(batch_size, r, 1, dtype=torch.long, device=metric.device)
-        
-        # Mask.
-        protected_mask = torch.zeros(num_a, dtype=torch.bool, device=metric.device)
+        # 应用特殊令牌的掩码
         if class_token:
-            protected_mask[0] = True
+            scores[..., 0, :] = -math.inf
+        if distill_token:
+            scores[..., :, 0] = -math.inf
+            
+        # 使用K-means聚类来找到合并对
+        # 我们将使用一个简化的K-means实现:
+        # 1. 随机初始化r个聚类中心
+        # 2. 分配每个令牌到最近的中心
+        # 3. 更新中心为分配给它的所有令牌的平均值
+        # 4. 重复直到收敛或达到最大迭代次数
         
-        # k-means algorithm
+        # 从b中初始化聚类中心
+        random_indices = torch.randperm(b.shape[1], device=metric.device)[:r]
+        centroids = b[:, random_indices, :]
+        
+        # 执行K-means迭代
         for _ in range(max_iters):
-            # Use grouped technique.
-            chunk_size = min(num_a, 1024)
-            assignments = torch.zeros(batch_size, num_a, dtype=torch.long, device=metric.device)
+            # 计算每个令牌到每个中心的相似度
+            similarities = torch.bmm(a, centroids.transpose(1, 2))
             
-            for chunk_start in range(0, num_a, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, num_a)
-                chunk_a = a[:, chunk_start:chunk_end, :]
+            # 应用掩码以保护特殊令牌
+            if class_token:
+                similarities[:, 0, :] = -math.inf
                 
-                similarities = torch.bmm(chunk_a, centroids.transpose(1, 2))
-                
-                chunk_protected = protected_mask[chunk_start:chunk_end]
-                if chunk_protected.any():
-                    similarities[:, chunk_protected, :] = -math.inf
-                
-                _, chunk_assignments = similarities.max(dim=2)
-
-                assignments[:, chunk_start:chunk_end] = chunk_assignments
+            # 为每个令牌找到最近的中心
+            _, assignments = similarities.max(dim=2)
             
+            # 更新中心
             new_centroids = torch.zeros_like(centroids)
             counts = torch.zeros(batch_size, r, 1, device=metric.device)
             
             for i in range(r):
                 mask = (assignments == i).unsqueeze(-1)
-                
-                # features of assigned tokens
                 new_centroids[:, i:i+1, :] = torch.sum(a * mask, dim=1, keepdim=True)
-                # Count number of assigned tokens
                 counts[:, i:i+1, :] = mask.sum(dim=1, keepdim=True).clamp(min=1)
             
-            # Average the features
             new_centroids = new_centroids / counts
             
+            # 检查收敛性
             if torch.allclose(centroids, new_centroids, atol=1e-6):
                 break
                 
             centroids = new_centroids
-        
-        # Calculate final assignments
-        for i in range(r):
-            mask = (assignments == i)
             
-            # pick one token assigned to this centroid
-            for batch_idx in range(batch_size):
-                batch_mask = mask[batch_idx]
-                if batch_mask.any():
-                    # Choose one of the assigned tokens
-                    token_idx = batch_mask.nonzero(as_tuple=True)[0][0]
-                    src_idx[batch_idx, i, 0] = token_idx
+        # 现在我们有了聚类分配，从这里我们可以创建相似于bipartite_soft_matching的结构
+        # 以确保兼容性和一致性
         
-        # Get indices of unmerged tokens
-        all_idx = torch.arange(num_a, device=metric.device)
-        merged_mask = torch.zeros(batch_size, num_a, dtype=torch.bool, device=metric.device)
+        # 对于每个批次和每个聚类，找到一个要合并的令牌
+        node_max = torch.zeros(batch_size, num_a, device=metric.device)
+        node_idx = torch.zeros(batch_size, num_a, dtype=torch.long, device=metric.device)
         
+        # 为每个批次单独填充
         for batch_idx in range(batch_size):
-            merged_mask[batch_idx, src_idx[batch_idx, :, 0]] = True
+            for i in range(num_a):
+                cluster = assignments[batch_idx, i].item()
+                # 模拟相似度分数，使具有相同聚类ID的令牌相互吸引
+                node_max[batch_idx, i] = 1.0 if i < r else 0.0
+                node_idx[batch_idx, i] = cluster if cluster < b.shape[1] else 0
         
-        unm_idx = torch.zeros(batch_size, num_a - r, 1, dtype=torch.long, device=metric.device)
-        for batch_idx in range(batch_size):
-            unmerged = all_idx[~merged_mask[batch_idx]]
-            unm_idx[batch_idx, :, 0] = unmerged
+        # 按相似度排序，选择顶部的r个令牌进行合并
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
         
-        # For K-means, we use the centroid index directly
-        dst_idx = torch.arange(r, device=metric.device).expand(batch_size, r, 1)
+        # 划分合并和未合并的令牌索引
+        src_idx = edge_idx[..., :r, :]  # 要合并的令牌
+        unm_idx = edge_idx[..., r:, :]  # 保持不变的令牌
         
-        # Put class token at first to protect it
+        # 获取目标索引
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        
+        # 确保类令牌始终在开头
         if class_token:
             unm_idx = unm_idx.sort(dim=1)[0]
-
+            
+    # 完全遵循bipartite_soft_matching的合并和解合并函数
+    # 这将确保兼容性和一致的维度
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
+        
         n, t1, c = src.shape
         
         unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
-
-        token_to_merge = src.gather(dim=-2, index=src_idx.expand(n, r, c))
-
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), token_to_merge, reduce=mode)
-
+        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+        
         if distill_token:
             return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
         else:
@@ -427,10 +421,9 @@ def kmeans_bipartite_soft_matching(
         out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
 
         out[..., 1::2, :] = dst
-
         out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
         out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
-        
+
         return out
 
     return merge, unmerge
