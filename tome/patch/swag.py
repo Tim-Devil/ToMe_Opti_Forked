@@ -56,12 +56,21 @@ def make_block_class(block_cls):
                 #     self._tome_info["distill_token"],
                 # )
 
-                merge, _ = kmeans_bipartite_soft_matching(
+                merge_func = self._tome_info.get("merge_func", grouped_bipartite_soft_matching)
+                merge, _ = merge_func(
                     metric,
                     r,
                     self._tome_info["class_token"],
                     self._tome_info["distill_token"],
                 )
+
+
+                # merge, _ = kmeans_bipartite_soft_matching(
+                #     metric,
+                #     r,
+                #     self._tome_info["class_token"],
+                #     self._tome_info["distill_token"],
+                # )
 
                 if self._tome_info["trace_source"]:
                     self._tome_info["source"] = merge_source(

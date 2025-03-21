@@ -128,6 +128,10 @@ def bipartite_soft_matching(
     return merge, unmerge
 
 # ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
 
 '''
 ADD:
@@ -156,103 +160,121 @@ ADD:
 # ------------------------------------------------------------------------------------------
 # Grouped:
 
+# def get_optimal_chunk_size(
+#     batch_size: int,
+#     num_tokens: int,
+#     feature_dim: int,
+#     available_memory_mb: int = 1024,
+#     dtype_bytes: int = 4             
+# ) -> int:
+#     """
+#     根据可用GPU内存和模型维度确定最佳分块大小。
+    
+#     参数:
+#         batch_size: 处理的批量大小
+#         num_tokens: 每个序列中的token数量
+#         feature_dim: token特征的维度
+#         available_memory_mb: 估计可用的GPU内存(MB)
+#         dtype_bytes: 每个元素的字节数(float32为4,float16为2)
+        
+#     返回:
+#         最佳分块大小
+#     """
+#     # 将可用内存转换为字节
+#     available_memory = available_memory_mb * 1024 * 1024
+    
+#     # 计算计算中不同张量的内存
+#     # 我们需要考虑:
+#     # 1. a和b张量
+#     # 2. 相似度矩阵(最内存密集)
+#     # 3. 计算的额外缓冲区
+    
+#     # token特征内存(a和b)
+#     token_features_memory = 2 * batch_size * num_tokens * feature_dim * dtype_bytes
+    
+#     # 可用于相似度矩阵的内存
+#     similarity_matrix_memory = available_memory - token_features_memory
+    
+#     # 根据可用内存计算最大分块大小
+#     # 相似度矩阵形状: [batch_size, num_tokens, chunk_size]
+#     max_chunk_size = similarity_matrix_memory // (batch_size * num_tokens * dtype_bytes)
+    
+#     # 应用合理的界限并确保至少为1
+#     max_chunk_size = max(1, min(max_chunk_size, num_tokens))
+    
+#     # 舍入到2的幂以获得更好的内存对齐
+#     chunk_size = 2 ** int(math.log2(max_chunk_size))
+    
+#     return chunk_size
+
+import torch
+from typing import Callable, Tuple
+import math
+
+
+def do_nothing(x, mode=None):
+    return x
+
+
 def grouped_bipartite_soft_matching(
-    metric: torch.Tensor,   # input matrix
-    r: int, # expected num of removed token
+    metric: torch.Tensor,
+    r: int,
     class_token: bool = False,
     distill_token: bool = False,
-    chunk_size: int = 1024,  
-    # size of chunk. Used to make wlb between speed and memory.
+    chunk_size: int = 64
 ) -> Tuple[Callable, Callable]:
-    
-    # Nothing special.
-    protected = 0
-    if class_token:
-        protected += 1
-    if distill_token:
-        protected += 1
-
+    protected = int(class_token) + int(distill_token)
     t = metric.shape[1]
     r = min(r, (t - protected) // 2)
 
     if r <= 0:
         return do_nothing, do_nothing
 
-    # Compute similarity score matrix(with chunk technique)
     with torch.no_grad():
-        # Normalize
-        metric = metric / metric.norm(dim=-1, keepdim=True)
-        
-        # odd and even divide.
+        metric.div_(metric.norm(dim=-1, keepdim=True) + 1e-6)
+
         a, b = metric[..., ::2, :], metric[..., 1::2, :]
-        
-        # Follow my habit. First determine data struct.
-        batch_size = metric.shape[0]
-        num_a_tokens = a.shape[1]
-        
-        # Prepare a new matrix to include our result.
+        batch_size, num_a_tokens, feat_dim = a.shape
+
         best_scores = torch.full((batch_size, num_a_tokens), -float('inf'), device=metric.device)
         best_indices = torch.zeros((batch_size, num_a_tokens), dtype=torch.long, device=metric.device)
-        
-        # Process in chunks to save memory.
+
         num_b_tokens = b.shape[1]
-        for chunk_start in range(0, num_b_tokens, chunk_size):
-            # Maybe not exact division
-            chunk_end = min(chunk_start + chunk_size, num_b_tokens)
-            # divide chunk from b matrix
-            b_chunk = b[..., chunk_start:chunk_end, :]
-            
-            # Compute partial similarity scores
-            # (b chunk with whole a)
-            chunk_scores = a @ b_chunk.transpose(-1, -2)  # [batch, num_a, chunk_size]
-            
-            # Apply masking for special tokens within this chunk
-            # Be advised that we only apply on the first chunk of each row
-            if class_token and chunk_start <= 0 < chunk_end:
-                chunk_scores[..., 0, :] = -math.inf
-            if distill_token and chunk_start <= 0 < chunk_end:
-                chunk_scores[..., :, 0] = -math.inf
-            
-            # Update best scores and indices
-            chunk_max_scores, chunk_max_indices = chunk_scores.max(dim=-1)
-            
-            # Adjust indices to account for chunking
-            chunk_max_indices = chunk_max_indices + chunk_start
-            
-            # Update the global best if better matches are found in this chunk
-            better_matches = chunk_max_scores > best_scores
-            best_scores[better_matches] = chunk_max_scores[better_matches]
-            best_indices[better_matches] = chunk_max_indices[better_matches]
-        
-        # Sort to find the top-r token pairs to merge
+
+        for start in range(0, num_b_tokens, chunk_size):
+            end = min(start + chunk_size, num_b_tokens)
+            chunk_scores = torch.bmm(a, b[:, start:end, :].transpose(-1, -2))
+
+            if class_token and start == 0:
+                chunk_scores[:, 0, :] = -float('inf')
+            if distill_token and start == 0:
+                chunk_scores[:, :, 0] = -float('inf')
+
+            max_scores, max_indices = chunk_scores.max(dim=-1)
+            max_indices += start
+
+            better = max_scores > best_scores
+            best_scores = torch.where(better, max_scores, best_scores)
+            best_indices = torch.where(better, max_indices, best_indices)
+
+            del chunk_scores, max_scores, max_indices, better
+
         sorted_indices = best_scores.argsort(dim=-1, descending=True)
-        
-        # Get indices of tokens to merge and to keep unchanged
-        src_idx = sorted_indices[..., :r, None]  # Tokens to merge
-        unm_idx = sorted_indices[..., r:, None]  # Tokens to keep unchanged
-        
-        # Get the destination indices (where to merge into)
-        dst_idx = best_indices[..., None].gather(dim=-2, index=src_idx)
-        
-        # If we have a class token, ensure it's at the beginning
+        src_idx = sorted_indices[:, :r, None]
+        unm_idx = sorted_indices[:, r:, None]
+        dst_idx = best_indices.gather(dim=-1, index=src_idx.squeeze(-1)).unsqueeze(-1)
+
         if class_token:
             unm_idx = unm_idx.sort(dim=1)[0]
 
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
-        
-        n, t1, c = src.shape
-        
-        # Gather tokens that remain unchanged
-        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
-        
-        # Gather source tokens that will be merged
-        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
-        
-        # Merge tokens into their destinations
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
-        
-        # Combine the results
+        n, _, c = src.shape
+
+        unm = src.gather(dim=1, index=unm_idx.expand(n, num_a_tokens - r, c))
+        src = src.gather(dim=1, index=src_idx.expand(n, r, c))
+        dst.scatter_reduce_(dim=1, index=dst_idx.expand(n, r, c), src=src, reduce=mode)
+
         if distill_token:
             return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
         else:
@@ -260,24 +282,23 @@ def grouped_bipartite_soft_matching(
 
     def unmerge(x: torch.Tensor) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
-        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+        unm, dst = x[:, :unm_len, :], x[:, unm_len:, :]
         n, _, c = unm.shape
 
-        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
-
+        src = dst.gather(dim=1, index=dst_idx.expand(n, r, c))
         out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
 
-        out[..., 1::2, :] = dst
-
-        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
-        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+        out[:, 1::2, :] = dst
+        out.scatter_(dim=1, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
+        out.scatter_(dim=1, index=(2 * src_idx).expand(n, r, c), src=src)
 
         return out
 
     return merge, unmerge
 
+
 # ------------------------------------------------------------------------------------------
-# K-means:
+# K-means:(In fact it is useless.)
 
 def kmeans_bipartite_soft_matching(
     metric: torch.Tensor,
@@ -286,70 +307,47 @@ def kmeans_bipartite_soft_matching(
     distill_token: bool = False,
     max_iters: int = 3,
 ) -> Tuple[Callable, Callable]:
-    """
-    使用K-means聚类应用ToMe算法进行令牌合并。
-    
-    输入大小为 [batch, tokens, channels]。
-    r 表示要移除的令牌数（最多为50%的令牌）。
-    """
+
     protected = 0
     if class_token:
         protected += 1
     if distill_token:
         protected += 1
 
-    # 限制移除的令牌数量不超过50%
     t = metric.shape[1]
     r = min(r, (t - protected) // 2)
 
     if r <= 0:
         return do_nothing, do_nothing
     
-    # 执行K-means聚类以确定要合并的令牌
     with torch.no_grad():
-        # 规范化特征向量
         metric = metric / metric.norm(dim=-1, keepdim=True)
         
-        # 分离偶数和奇数位置的令牌
         a, b = metric[..., ::2, :], metric[..., 1::2, :]
         
-        # 获取形状信息
-        batch_size, num_a, feat_dim = a.shape
+        batch_size, num_a, _ = a.shape
         
-        # 创建与原始bipartite_soft_matching相同模式的存储结构
-        # 这样可以确保形状一致性
-        scores = a @ b.transpose(-1, -2)  # 计算相似度矩阵
-        
-        # 应用特殊令牌的掩码
+        scores = a @ b.transpose(-1, -2)
+        # Still need to `@` to determine k-means so it is useless.
+
         if class_token:
             scores[..., 0, :] = -math.inf
         if distill_token:
             scores[..., :, 0] = -math.inf
-            
-        # 使用K-means聚类来找到合并对
-        # 我们将使用一个简化的K-means实现:
-        # 1. 随机初始化r个聚类中心
-        # 2. 分配每个令牌到最近的中心
-        # 3. 更新中心为分配给它的所有令牌的平均值
-        # 4. 重复直到收敛或达到最大迭代次数
         
         # 从b中初始化聚类中心
         random_indices = torch.randperm(b.shape[1], device=metric.device)[:r]
         centroids = b[:, random_indices, :]
         
-        # 执行K-means迭代
+        # 
         for _ in range(max_iters):
-            # 计算每个令牌到每个中心的相似度
             similarities = torch.bmm(a, centroids.transpose(1, 2))
             
-            # 应用掩码以保护特殊令牌
             if class_token:
                 similarities[:, 0, :] = -math.inf
                 
-            # 为每个令牌找到最近的中心
             _, assignments = similarities.max(dim=2)
             
-            # 更新中心
             new_centroids = torch.zeros_like(centroids)
             counts = torch.zeros(batch_size, r, 1, device=metric.device)
             
@@ -360,43 +358,32 @@ def kmeans_bipartite_soft_matching(
             
             new_centroids = new_centroids / counts
             
-            # 检查收敛性
             if torch.allclose(centroids, new_centroids, atol=1e-6):
                 break
                 
             centroids = new_centroids
             
-        # 现在我们有了聚类分配，从这里我们可以创建相似于bipartite_soft_matching的结构
-        # 以确保兼容性和一致性
-        
-        # 对于每个批次和每个聚类，找到一个要合并的令牌
         node_max = torch.zeros(batch_size, num_a, device=metric.device)
         node_idx = torch.zeros(batch_size, num_a, dtype=torch.long, device=metric.device)
         
-        # 为每个批次单独填充
         for batch_idx in range(batch_size):
             for i in range(num_a):
                 cluster = assignments[batch_idx, i].item()
-                # 模拟相似度分数，使具有相同聚类ID的令牌相互吸引
+                
                 node_max[batch_idx, i] = 1.0 if i < r else 0.0
                 node_idx[batch_idx, i] = cluster if cluster < b.shape[1] else 0
         
-        # 按相似度排序，选择顶部的r个令牌进行合并
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
         
-        # 划分合并和未合并的令牌索引
-        src_idx = edge_idx[..., :r, :]  # 要合并的令牌
-        unm_idx = edge_idx[..., r:, :]  # 保持不变的令牌
+
+        src_idx = edge_idx[..., :r, :]
+        unm_idx = edge_idx[..., r:, :]
         
-        # 获取目标索引
         dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
         
-        # 确保类令牌始终在开头
         if class_token:
             unm_idx = unm_idx.sort(dim=1)[0]
             
-    # 完全遵循bipartite_soft_matching的合并和解合并函数
-    # 这将确保兼容性和一致的维度
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
         
@@ -428,6 +415,133 @@ def kmeans_bipartite_soft_matching(
 
     return merge, unmerge
 
+# ------------------------------------------------------------------------------------------
+
+def iga_bipartite_soft_matching(
+    metric: torch.Tensor,
+    r: int,
+    class_token: bool = False,
+    distill_token: bool = False,
+    max_iterations: int = 1,
+    memory_efficient: bool = True
+) -> Tuple[Callable, Callable]:
+
+    protected = 0
+    if class_token:
+        protected += 1
+    if distill_token:
+        protected += 1
+
+    t = metric.shape[1]
+    r = min(r, (t - protected) // 2)
+
+    if r <= 0:
+        return do_nothing, do_nothing
+    
+    with torch.no_grad():
+        if memory_efficient:
+            norm = metric.norm(dim=-1, keepdim=True)
+            metric.div_(norm)
+            del norm
+        else:
+            metric = metric / metric.norm(dim=-1, keepdim=True)
+            
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        
+        batch_size, num_a_tokens, feat_dim = a.shape
+        
+        similarities = torch.bmm(a, b.transpose(-1, -2))
+        
+        if class_token:
+            similarities[:, 0, :] = -float('inf')
+        if distill_token:
+            similarities[:, :, 0] = -float('inf')
+        
+        node_scores, node_indices = similarities.max(dim=-1)
+        
+        if memory_efficient:
+            del similarities
+        
+        if max_iterations > 1:
+            sorted_scores, sorted_indices = node_scores.sort(dim=-1, descending=True)
+            top_indices = sorted_indices[:, :min(r*2, num_a_tokens)]
+            
+            top_k = top_indices.shape[1]
+            for iter_idx in range(1, max_iterations):
+                improved = False
+                
+                for i in range(top_k-1):
+                    for j in range(i+1, top_k):
+                        for batch_idx in range(batch_size):
+                            idx_i = top_indices[batch_idx, i].item()
+                            idx_j = top_indices[batch_idx, j].item()
+                            
+                            curr_i_score = node_scores[batch_idx, idx_i]
+                            curr_j_score = node_scores[batch_idx, idx_j]
+                            curr_score = curr_i_score + curr_j_score
+                            
+                            target_i = node_indices[batch_idx, idx_i].item()
+                            target_j = node_indices[batch_idx, idx_j].item()
+                            
+                            new_i_score = torch.dot(a[batch_idx, idx_i], b[batch_idx, target_j])
+                            new_j_score = torch.dot(a[batch_idx, idx_j], b[batch_idx, target_i])
+                            new_score = new_i_score + new_j_score
+                            
+                            if new_score > curr_score:
+                                improved = True
+                                node_indices[batch_idx, idx_i] = target_j
+                                node_indices[batch_idx, idx_j] = target_i
+                                node_scores[batch_idx, idx_i] = new_i_score
+                                node_scores[batch_idx, idx_j] = new_j_score
+                
+                if not improved:
+                    break
+        
+        edge_idx = node_scores.argsort(dim=-1, descending=True)[..., None]
+        
+        src_idx = edge_idx[..., :r, :]
+        unm_idx = edge_idx[..., r:, :]
+        
+        dst_idx = node_indices[..., None].gather(dim=-2, index=src_idx)
+        
+        if class_token:
+            unm_idx = unm_idx.sort(dim=1)[0]
+    
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        
+        n, t1, c = src.shape
+        
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+        
+        if distill_token:
+            return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
+        else:
+            return torch.cat([unm, dst], dim=1)
+
+    def unmerge(x: torch.Tensor) -> torch.Tensor:
+        unm_len = unm_idx.shape[1]
+        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+        n, _, c = unm.shape
+        
+        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
+        
+        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
+        
+        out[..., 1::2, :] = dst
+        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
+        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+        
+        return out
+
+    return merge, unmerge
+
+# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------------
 
 def kth_bipartite_soft_matching(
