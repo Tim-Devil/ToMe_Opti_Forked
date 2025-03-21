@@ -42,12 +42,12 @@ def make_block_class(block_cls):
             if r > 0:
                 # Apply ToMe here
 
-                # merge, _ = bipartite_soft_matching(
-                #     metric,
-                #     r,
-                #     self._tome_info["class_token"],
-                #     self._tome_info["distill_token"],
-                # )
+                merge, _ = bipartite_soft_matching(
+                    metric,
+                    r,
+                    self._tome_info["class_token"],
+                    self._tome_info["distill_token"],
+                )
 
                 # merge, _ = grouped_bipartite_soft_matching(
                 #     metric,
@@ -56,12 +56,12 @@ def make_block_class(block_cls):
                 #     self._tome_info["distill_token"],
                 # )
 
-                merge, _ = kmeans_bipartite_soft_matching(
-                    metric,
-                    r,
-                    self._tome_info["class_token"],
-                    self._tome_info["distill_token"],
-                )
+                # merge, _ = kmeans_bipartite_soft_matching(
+                #     metric,
+                #     r,
+                #     self._tome_info["class_token"],
+                #     self._tome_info["distill_token"],
+                # )
 
                 if self._tome_info["trace_source"]:
                     self._tome_info["source"] = merge_source(
