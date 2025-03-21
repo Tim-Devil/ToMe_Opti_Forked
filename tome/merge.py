@@ -160,53 +160,6 @@ ADD:
 # ------------------------------------------------------------------------------------------
 # Grouped:
 
-# def get_optimal_chunk_size(
-#     batch_size: int,
-#     num_tokens: int,
-#     feature_dim: int,
-#     available_memory_mb: int = 1024,
-#     dtype_bytes: int = 4             
-# ) -> int:
-#     """
-#     根据可用GPU内存和模型维度确定最佳分块大小。
-    
-#     参数:
-#         batch_size: 处理的批量大小
-#         num_tokens: 每个序列中的token数量
-#         feature_dim: token特征的维度
-#         available_memory_mb: 估计可用的GPU内存(MB)
-#         dtype_bytes: 每个元素的字节数(float32为4,float16为2)
-        
-#     返回:
-#         最佳分块大小
-#     """
-#     # 将可用内存转换为字节
-#     available_memory = available_memory_mb * 1024 * 1024
-    
-#     # 计算计算中不同张量的内存
-#     # 我们需要考虑:
-#     # 1. a和b张量
-#     # 2. 相似度矩阵(最内存密集)
-#     # 3. 计算的额外缓冲区
-    
-#     # token特征内存(a和b)
-#     token_features_memory = 2 * batch_size * num_tokens * feature_dim * dtype_bytes
-    
-#     # 可用于相似度矩阵的内存
-#     similarity_matrix_memory = available_memory - token_features_memory
-    
-#     # 根据可用内存计算最大分块大小
-#     # 相似度矩阵形状: [batch_size, num_tokens, chunk_size]
-#     max_chunk_size = similarity_matrix_memory // (batch_size * num_tokens * dtype_bytes)
-    
-#     # 应用合理的界限并确保至少为1
-#     max_chunk_size = max(1, min(max_chunk_size, num_tokens))
-    
-#     # 舍入到2的幂以获得更好的内存对齐
-#     chunk_size = 2 ** int(math.log2(max_chunk_size))
-    
-#     return chunk_size
-
 import torch
 from typing import Callable, Tuple
 import math
@@ -300,243 +253,243 @@ def grouped_bipartite_soft_matching(
 # ------------------------------------------------------------------------------------------
 # K-means:(In fact it is useless.)
 
-def kmeans_bipartite_soft_matching(
-    metric: torch.Tensor,
-    r: int,
-    class_token: bool = False,
-    distill_token: bool = False,
-    max_iters: int = 3,
-) -> Tuple[Callable, Callable]:
+# def kmeans_bipartite_soft_matching(
+#     metric: torch.Tensor,
+#     r: int,
+#     class_token: bool = False,
+#     distill_token: bool = False,
+#     max_iters: int = 3,
+# ) -> Tuple[Callable, Callable]:
 
-    protected = 0
-    if class_token:
-        protected += 1
-    if distill_token:
-        protected += 1
+#     protected = 0
+#     if class_token:
+#         protected += 1
+#     if distill_token:
+#         protected += 1
 
-    t = metric.shape[1]
-    r = min(r, (t - protected) // 2)
+#     t = metric.shape[1]
+#     r = min(r, (t - protected) // 2)
 
-    if r <= 0:
-        return do_nothing, do_nothing
+#     if r <= 0:
+#         return do_nothing, do_nothing
     
-    with torch.no_grad():
-        metric = metric / metric.norm(dim=-1, keepdim=True)
+#     with torch.no_grad():
+#         metric = metric / metric.norm(dim=-1, keepdim=True)
         
-        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+#         a, b = metric[..., ::2, :], metric[..., 1::2, :]
         
-        batch_size, num_a, _ = a.shape
+#         batch_size, num_a, _ = a.shape
         
-        scores = a @ b.transpose(-1, -2)
-        # Still need to `@` to determine k-means so it is useless.
+#         scores = a @ b.transpose(-1, -2)
+#         # Still need to `@` to determine k-means so it is useless.
 
-        if class_token:
-            scores[..., 0, :] = -math.inf
-        if distill_token:
-            scores[..., :, 0] = -math.inf
+#         if class_token:
+#             scores[..., 0, :] = -math.inf
+#         if distill_token:
+#             scores[..., :, 0] = -math.inf
         
-        # 从b中初始化聚类中心
-        random_indices = torch.randperm(b.shape[1], device=metric.device)[:r]
-        centroids = b[:, random_indices, :]
+#         random_indices = torch.randperm(b.shape[1], device=metric.device)[:r]
+#         centroids = b[:, random_indices, :]
         
-        # 
-        for _ in range(max_iters):
-            similarities = torch.bmm(a, centroids.transpose(1, 2))
+#         for _ in range(max_iters):
+#             similarities = torch.bmm(a, centroids.transpose(1, 2))
             
-            if class_token:
-                similarities[:, 0, :] = -math.inf
+#             if class_token:
+#                 similarities[:, 0, :] = -math.inf
                 
-            _, assignments = similarities.max(dim=2)
+#             _, assignments = similarities.max(dim=2)
             
-            new_centroids = torch.zeros_like(centroids)
-            counts = torch.zeros(batch_size, r, 1, device=metric.device)
+#             new_centroids = torch.zeros_like(centroids)
+#             counts = torch.zeros(batch_size, r, 1, device=metric.device)
             
-            for i in range(r):
-                mask = (assignments == i).unsqueeze(-1)
-                new_centroids[:, i:i+1, :] = torch.sum(a * mask, dim=1, keepdim=True)
-                counts[:, i:i+1, :] = mask.sum(dim=1, keepdim=True).clamp(min=1)
+#             for i in range(r):
+#                 mask = (assignments == i).unsqueeze(-1)
+#                 new_centroids[:, i:i+1, :] = torch.sum(a * mask, dim=1, keepdim=True)
+#                 counts[:, i:i+1, :] = mask.sum(dim=1, keepdim=True).clamp(min=1)
             
-            new_centroids = new_centroids / counts
+#             new_centroids = new_centroids / counts
             
-            if torch.allclose(centroids, new_centroids, atol=1e-6):
-                break
+#             if torch.allclose(centroids, new_centroids, atol=1e-6):
+#                 break
                 
-            centroids = new_centroids
+#             centroids = new_centroids
             
-        node_max = torch.zeros(batch_size, num_a, device=metric.device)
-        node_idx = torch.zeros(batch_size, num_a, dtype=torch.long, device=metric.device)
+#         node_max = torch.zeros(batch_size, num_a, device=metric.device)
+#         node_idx = torch.zeros(batch_size, num_a, dtype=torch.long, device=metric.device)
         
-        for batch_idx in range(batch_size):
-            for i in range(num_a):
-                cluster = assignments[batch_idx, i].item()
+#         for batch_idx in range(batch_size):
+#             for i in range(num_a):
+#                 cluster = assignments[batch_idx, i].item()
                 
-                node_max[batch_idx, i] = 1.0 if i < r else 0.0
-                node_idx[batch_idx, i] = cluster if cluster < b.shape[1] else 0
+#                 node_max[batch_idx, i] = 1.0 if i < r else 0.0
+#                 node_idx[batch_idx, i] = cluster if cluster < b.shape[1] else 0
         
-        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+#         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
         
 
-        src_idx = edge_idx[..., :r, :]
-        unm_idx = edge_idx[..., r:, :]
+#         src_idx = edge_idx[..., :r, :]
+#         unm_idx = edge_idx[..., r:, :]
         
-        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+#         dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
         
-        if class_token:
-            unm_idx = unm_idx.sort(dim=1)[0]
+#         if class_token:
+#             unm_idx = unm_idx.sort(dim=1)[0]
             
-    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
-        src, dst = x[..., ::2, :], x[..., 1::2, :]
+#     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+#         src, dst = x[..., ::2, :], x[..., 1::2, :]
         
-        n, t1, c = src.shape
+#         n, t1, c = src.shape
         
-        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
-        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+#         unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+#         src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+#         dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
         
-        if distill_token:
-            return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
-        else:
-            return torch.cat([unm, dst], dim=1)
+#         if distill_token:
+#             return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
+#         else:
+#             return torch.cat([unm, dst], dim=1)
 
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
-        unm_len = unm_idx.shape[1]
-        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
-        n, _, c = unm.shape
+#     def unmerge(x: torch.Tensor) -> torch.Tensor:
+#         unm_len = unm_idx.shape[1]
+#         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+#         n, _, c = unm.shape
 
-        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
+#         src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
 
-        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
+#         out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
 
-        out[..., 1::2, :] = dst
-        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
-        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+#         out[..., 1::2, :] = dst
+#         out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
+#         out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
 
-        return out
+#         return out
 
-    return merge, unmerge
+#     return merge, unmerge
 
 # ------------------------------------------------------------------------------------------
+# IGA. Awfully awful and do not want to continue optimizing. 2x consume compared with origin model.
 
-def iga_bipartite_soft_matching(
-    metric: torch.Tensor,
-    r: int,
-    class_token: bool = False,
-    distill_token: bool = False,
-    max_iterations: int = 1,
-    memory_efficient: bool = True
-) -> Tuple[Callable, Callable]:
 
-    protected = 0
-    if class_token:
-        protected += 1
-    if distill_token:
-        protected += 1
+# def iga_bipartite_soft_matching(
+#     metric: torch.Tensor,
+#     r: int,
+#     class_token: bool = False,
+#     distill_token: bool = False,
+#     max_iterations: int = 1,
+#     memory_efficient: bool = True
+# ) -> Tuple[Callable, Callable]:
 
-    t = metric.shape[1]
-    r = min(r, (t - protected) // 2)
+#     protected = 0
+#     if class_token:
+#         protected += 1
+#     if distill_token:
+#         protected += 1
 
-    if r <= 0:
-        return do_nothing, do_nothing
+#     t = metric.shape[1]
+#     r = min(r, (t - protected) // 2)
+
+#     if r <= 0:
+#         return do_nothing, do_nothing
     
-    with torch.no_grad():
-        if memory_efficient:
-            norm = metric.norm(dim=-1, keepdim=True)
-            metric.div_(norm)
-            del norm
-        else:
-            metric = metric / metric.norm(dim=-1, keepdim=True)
+#     with torch.no_grad():
+#         if memory_efficient:
+#             norm = metric.norm(dim=-1, keepdim=True)
+#             metric.div_(norm)
+#             del norm
+#         else:
+#             metric = metric / metric.norm(dim=-1, keepdim=True)
             
-        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+#         a, b = metric[..., ::2, :], metric[..., 1::2, :]
         
-        batch_size, num_a_tokens, feat_dim = a.shape
+#         batch_size, num_a_tokens, feat_dim = a.shape
         
-        similarities = torch.bmm(a, b.transpose(-1, -2))
+#         similarities = torch.bmm(a, b.transpose(-1, -2))
         
-        if class_token:
-            similarities[:, 0, :] = -float('inf')
-        if distill_token:
-            similarities[:, :, 0] = -float('inf')
+#         if class_token:
+#             similarities[:, 0, :] = -float('inf')
+#         if distill_token:
+#             similarities[:, :, 0] = -float('inf')
         
-        node_scores, node_indices = similarities.max(dim=-1)
+#         node_scores, node_indices = similarities.max(dim=-1)
         
-        if memory_efficient:
-            del similarities
+#         if memory_efficient:
+#             del similarities
         
-        if max_iterations > 1:
-            sorted_scores, sorted_indices = node_scores.sort(dim=-1, descending=True)
-            top_indices = sorted_indices[:, :min(r*2, num_a_tokens)]
+#         if max_iterations > 1:
+#             sorted_scores, sorted_indices = node_scores.sort(dim=-1, descending=True)
+#             top_indices = sorted_indices[:, :min(r*2, num_a_tokens)]
             
-            top_k = top_indices.shape[1]
-            for iter_idx in range(1, max_iterations):
-                improved = False
+#             top_k = top_indices.shape[1]
+#             for iter_idx in range(1, max_iterations):
+#                 improved = False
                 
-                for i in range(top_k-1):
-                    for j in range(i+1, top_k):
-                        for batch_idx in range(batch_size):
-                            idx_i = top_indices[batch_idx, i].item()
-                            idx_j = top_indices[batch_idx, j].item()
+#                 for i in range(top_k-1):
+#                     for j in range(i+1, top_k):
+#                         for batch_idx in range(batch_size):
+#                             idx_i = top_indices[batch_idx, i].item()
+#                             idx_j = top_indices[batch_idx, j].item()
                             
-                            curr_i_score = node_scores[batch_idx, idx_i]
-                            curr_j_score = node_scores[batch_idx, idx_j]
-                            curr_score = curr_i_score + curr_j_score
+#                             curr_i_score = node_scores[batch_idx, idx_i]
+#                             curr_j_score = node_scores[batch_idx, idx_j]
+#                             curr_score = curr_i_score + curr_j_score
                             
-                            target_i = node_indices[batch_idx, idx_i].item()
-                            target_j = node_indices[batch_idx, idx_j].item()
+#                             target_i = node_indices[batch_idx, idx_i].item()
+#                             target_j = node_indices[batch_idx, idx_j].item()
                             
-                            new_i_score = torch.dot(a[batch_idx, idx_i], b[batch_idx, target_j])
-                            new_j_score = torch.dot(a[batch_idx, idx_j], b[batch_idx, target_i])
-                            new_score = new_i_score + new_j_score
+#                             new_i_score = torch.dot(a[batch_idx, idx_i], b[batch_idx, target_j])
+#                             new_j_score = torch.dot(a[batch_idx, idx_j], b[batch_idx, target_i])
+#                             new_score = new_i_score + new_j_score
                             
-                            if new_score > curr_score:
-                                improved = True
-                                node_indices[batch_idx, idx_i] = target_j
-                                node_indices[batch_idx, idx_j] = target_i
-                                node_scores[batch_idx, idx_i] = new_i_score
-                                node_scores[batch_idx, idx_j] = new_j_score
+#                             if new_score > curr_score:
+#                                 improved = True
+#                                 node_indices[batch_idx, idx_i] = target_j
+#                                 node_indices[batch_idx, idx_j] = target_i
+#                                 node_scores[batch_idx, idx_i] = new_i_score
+#                                 node_scores[batch_idx, idx_j] = new_j_score
                 
-                if not improved:
-                    break
+#                 if not improved:
+#                     break
         
-        edge_idx = node_scores.argsort(dim=-1, descending=True)[..., None]
+#         edge_idx = node_scores.argsort(dim=-1, descending=True)[..., None]
         
-        src_idx = edge_idx[..., :r, :]
-        unm_idx = edge_idx[..., r:, :]
+#         src_idx = edge_idx[..., :r, :]
+#         unm_idx = edge_idx[..., r:, :]
         
-        dst_idx = node_indices[..., None].gather(dim=-2, index=src_idx)
+#         dst_idx = node_indices[..., None].gather(dim=-2, index=src_idx)
         
-        if class_token:
-            unm_idx = unm_idx.sort(dim=1)[0]
+#         if class_token:
+#             unm_idx = unm_idx.sort(dim=1)[0]
     
-    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
-        src, dst = x[..., ::2, :], x[..., 1::2, :]
+#     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+#         src, dst = x[..., ::2, :], x[..., 1::2, :]
         
-        n, t1, c = src.shape
+#         n, t1, c = src.shape
         
-        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
-        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+#         unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+#         src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+#         dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
         
-        if distill_token:
-            return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
-        else:
-            return torch.cat([unm, dst], dim=1)
+#         if distill_token:
+#             return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
+#         else:
+#             return torch.cat([unm, dst], dim=1)
 
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
-        unm_len = unm_idx.shape[1]
-        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
-        n, _, c = unm.shape
+#     def unmerge(x: torch.Tensor) -> torch.Tensor:
+#         unm_len = unm_idx.shape[1]
+#         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+#         n, _, c = unm.shape
         
-        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
+#         src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
         
-        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
+#         out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
         
-        out[..., 1::2, :] = dst
-        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
-        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+#         out[..., 1::2, :] = dst
+#         out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
+#         out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
         
-        return out
+#         return out
 
-    return merge, unmerge
+#     return merge, unmerge
 
 # ------------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------------
