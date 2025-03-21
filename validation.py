@@ -137,5 +137,4 @@ def compare_memory_different_r(r_values, batch_size, tokens, channels, chunk_siz
 
 if __name__ == '__main__':
     r_values = [128, 256, 512, 768, 1024]
-    chunk = [2, 4, 8, 16, 32, 64, 128, 256]
     compare_memory_different_r(r_values, batch_size=16, tokens=2048, channels=768, chunk_size=2)
